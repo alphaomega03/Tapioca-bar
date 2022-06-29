@@ -1,158 +1,193 @@
 import hh from 'hardhat';
 import { assert } from 'chai';
-import { register } from './test.utils';
+import { ethers } from 'hardhat';
+import { register, setBalance } from './test.utils';
+import { expect } from 'chai';
+import { makeRandomBid } from './integration-test.utils';
 
 describe.only('LiquidationQueue', async () => {
-    it('Should execute a bid', async () => {
-        await new Promise<void>(async (resolve, reject) => {
-            const {
-                deployer,
-                yieldBox,
-                eoa1,
-                weth,
-                wethUsdcMixologist,
-                __wethUsdcPrice,
-                wethUsdcOracle,
-                liquidationQueue,
-                multiSwapper,
-                usdc,
-                LQ_META,
-                BN,
-            } = await register();
-            await (await weth.freeMint(LQ_META.minBidAmount)).wait();
-            await (
-                await weth.approve(yieldBox.address, LQ_META.minBidAmount)
-            ).wait();
+    it('should make a bid with a random premium between 0 and 10%', async () => {
+        const { liquidationQueue, deployer, weth, LQ_META, yieldBox } =
+            await register();
 
-            const POOL = 5;
-            const marketAssetId = await wethUsdcMixologist.assetId();
-            const marketColId = await wethUsdcMixologist.collateralId();
+        const randomPremium = await makeRandomBid(
+            liquidationQueue,
+            deployer,
+            weth,
+            LQ_META,
+            yieldBox,
+        );
 
-            await yieldBox.depositAsset(
-                await liquidationQueue.lqAssetId(),
+        await expect(
+            liquidationQueue.bid(
                 deployer.address,
-                deployer.address,
+                randomPremium,
                 LQ_META.minBidAmount,
-                0,
+            ),
+        ).to.emit(liquidationQueue, 'Bid');
+
+        expect(
+            (await liquidationQueue.bidPools(randomPremium, deployer.address))
+                .amount,
+        ).to.equal(LQ_META.minBidAmount);
+    });
+
+    it('should make multiple bids with random premiums', async () => {
+        const accounts = await ethers.getSigners();
+        const { liquidationQueue, weth, LQ_META, yieldBox } = await register();
+        accounts.forEach(async (account) => {
+            const randomPremium = await makeRandomBid(
+                liquidationQueue,
+                account,
+                weth,
+                LQ_META,
+                yieldBox,
             );
 
-            await yieldBox.setApprovalForAll(liquidationQueue.address, true);
-            liquidationQueue.once('Bid', async () => {
-                try {
-                    assert(
-                        (
-                            await liquidationQueue.bidPools(
-                                POOL,
-                                deployer.address,
-                            )
-                        ).amount.eq(LQ_META.minBidAmount),
-                        'Bid for deployer address is equal to bid amount',
-                    );
-                } catch (e) {
-                    reject(e);
-                }
-            });
+            await expect(
+                liquidationQueue.bid(
+                    account.address,
+                    randomPremium,
+                    LQ_META.minBidAmount,
+                ),
+            ).to.emit(liquidationQueue, 'Bid');
+
+            expect(
+                (
+                    await liquidationQueue.bidPools(
+                        randomPremium,
+                        account.address,
+                    )
+                ).amount,
+            ).to.equal(LQ_META.minBidAmount);
+        });
+    });
+
+    it('should liquidate multiple users and collect fees', async () => {
+        const {
+            liquidationQueue,
+            deployer,
+            weth,
+            usdc,
+            LQ_META,
+            wethUsdcOracle,
+            multiSwapper,
+            yieldBox,
+            __wethUsdcPrice,
+            feeCollector,
+            wethUsdcMixologist,
+            BN,
+        } = await register();
+
+        const marketAssetId = await wethUsdcMixologist.assetId();
+        const marketColId = await wethUsdcMixologist.collateralId();
+        const wethAmount = BN(1e18).mul(100);
+
+        const users = [];
+
+        for (let i = 0; i < 1000; i++) {
+            const eoa = new ethers.Wallet(
+                ethers.Wallet.createRandom().privateKey,
+                ethers.provider,
+            );
+
+            await setBalance(eoa.address, 100000);
+            const randomPremium = await makeRandomBid(
+                liquidationQueue,
+                deployer,
+                weth,
+                LQ_META,
+                yieldBox,
+            );
 
             await liquidationQueue.bid(
                 deployer.address,
-                POOL,
-                LQ_META.minBidAmount,
+                randomPremium,
+                LQ_META.minBidAmount.mul(100),
             );
-            // Wait 10min
+
+            users.push({ premium: randomPremium, account: eoa });
+
             await hh.network.provider.send('evm_increaseTime', [10_000]);
             await hh.network.provider.send('evm_mine');
+            await liquidationQueue.activateBid(deployer.address, randomPremium);
 
-            liquidationQueue.once('ActivateBid', async () => {
-                try {
-                    assert(
-                        (
-                            await liquidationQueue.bidPools(
-                                POOL,
-                                deployer.address,
-                            )
-                        ).amount.eq(0),
-                        'Check that bid pool entry was removed from queue',
-                    );
-                } catch (e) {
-                    reject(e);
-                }
-            });
-
-            await liquidationQueue.activateBid(deployer.address, POOL);
-
-            const wethAmount = BN(1e18).mul(100);
-            await weth.connect(eoa1).freeMint(wethAmount);
-            await weth.connect(eoa1).approve(yieldBox.address, wethAmount);
+            await weth.connect(eoa).freeMint(wethAmount);
+            await weth.connect(eoa).approve(yieldBox.address, wethAmount);
 
             await yieldBox
-                .connect(eoa1)
+                .connect(eoa)
                 .depositAsset(
                     marketAssetId,
-                    eoa1.address,
-                    eoa1.address,
+                    eoa.address,
+                    eoa.address,
                     wethAmount,
                     0,
                 );
+
             await yieldBox
-                .connect(eoa1)
+                .connect(eoa)
                 .setApprovalForAll(wethUsdcMixologist.address, true);
             await wethUsdcMixologist
-                .connect(eoa1)
+                .connect(eoa)
                 .addAsset(
-                    eoa1.address,
+                    eoa.address,
                     false,
                     await yieldBox.toShare(marketAssetId, wethAmount, false),
                 );
-
-            // Mint some usdc to deposit as collateral and borrow with deployer
             const usdcAmount = wethAmount.mul(__wethUsdcPrice.div(BN(1e18)));
             const borrowAmount = usdcAmount
                 .mul(74)
                 .div(100)
                 .div(__wethUsdcPrice.div(BN(1e18)));
 
-            await usdc.freeMint(usdcAmount);
-            await usdc.approve(yieldBox.address, usdcAmount);
-            await yieldBox.depositAsset(
-                marketColId,
-                deployer.address,
-                deployer.address,
-                usdcAmount,
-                0,
-            );
-
+            await usdc.connect(eoa).freeMint(usdcAmount);
+            await usdc.connect(eoa).approve(yieldBox.address, usdcAmount);
+            await yieldBox
+                .connect(eoa)
+                .depositAsset(
+                    marketColId,
+                    eoa.address,
+                    eoa.address,
+                    usdcAmount,
+                    0,
+                );
             await yieldBox.setApprovalForAll(wethUsdcMixologist.address, true);
-            await wethUsdcMixologist.addCollateral(
-                deployer.address,
-                false,
-                await yieldBox.toShare(marketColId, usdcAmount, false),
-            );
-            await wethUsdcMixologist.borrow(deployer.address, borrowAmount);
+            await wethUsdcMixologist
+                .connect(eoa)
+                .addCollateral(
+                    eoa.address,
+                    false,
+                    await yieldBox.toShare(marketColId, usdcAmount, false),
+                );
+            await wethUsdcMixologist
+                .connect(eoa)
+                .borrow(eoa.address, borrowAmount);
+        }
 
-            // Make some price movement and liquidate
-            const priceDrop = __wethUsdcPrice.mul(5).div(100);
-            await wethUsdcOracle.set(__wethUsdcPrice.add(priceDrop));
-            await wethUsdcMixologist.updateExchangeRate();
+        const priceDrop = __wethUsdcPrice.mul(5).div(100);
 
-            wethUsdcMixologist.once('LogRemoveCollateral', async () => {
-                try {
-                    assert(
-                        (await liquidationQueue.balancesDue(
-                            deployer.address,
-                        )) !== BN(0),
-                        'Check that LQ Balances were added',
-                    );
-                    resolve();
-                } catch (e) {
-                    reject(e);
-                }
-            });
+        await wethUsdcOracle.set(__wethUsdcPrice.add(priceDrop));
+        await wethUsdcMixologist.updateExchangeRate();
 
+        const userAddresses = users.map((user) => user.account.address);
+
+        await expect(
             wethUsdcMixologist.liquidate(
-                [deployer.address],
+                userAddresses,
                 [await wethUsdcMixologist.userBorrowPart(deployer.address)],
                 multiSwapper.address,
-            );
-        });
+            ),
+        ).to.not.be.reverted;
+
+        expect(await liquidationQueue.balancesDue(deployer.address)).to.not.eq(
+            0,
+        );
+
+        await liquidationQueue.redeem(feeCollector.address);
+
+        expect(
+            await liquidationQueue.balancesDue(feeCollector.address),
+        ).to.not.eq(0);
     });
 });
